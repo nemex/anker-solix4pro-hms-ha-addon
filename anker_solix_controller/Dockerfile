@@ -2,7 +2,7 @@ FROM python:3.11-alpine
 
 # bash wird für 'wait -n' in run.sh benötigt.
 RUN apk add --no-cache bash \
-    && pip3 install --no-cache-dir requests
+    && pip3 install --no-cache-dir requests pyModbusTCP
 
 WORKDIR /app
 COPY controller.py /app/

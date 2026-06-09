@@ -30,11 +30,29 @@ options:
   grid_sensor: "sensor.shellypro3em_leistung"
   soc_sensor: "sensor.anker_solix_soc"
   hms_2000_entity: "number.hoymiles_hms_2000_4t_limit_nonpersistent_absolute"
+  hms_2000_power_sensor: "sensor.hoymiles_hms_2000_4t_power"
+  hms_2000_reachable_sensor: "binary_sensor.hoymiles_hms_2000_4t_reachable"
+  soc_normal_max: 95
+  soc_min: 10
+  calibration_days: 15
   dry_run: true
+  manual_feed_in_switch: "input_boolean.anker_manual_feed_in"
+  manual_feed_in_target: 0.5
+  manual_feed_in_min_soc: 90.0
+  manual_feed_in_power: 800
 schema:
   shelly_ip: str
   solix_ip: str
   grid_sensor: str
   soc_sensor: str
   hms_2000_entity: str
+  hms_2000_power_sensor: str
+  hms_2000_reachable_sensor: str
+  soc_normal_max: int
+  soc_min: int
+  calibration_days: int
   dry_run: bool
+  manual_feed_in_switch: str
+  manual_feed_in_target: float
+  manual_feed_in_min_soc: float
+  manual_feed_in_power: int
