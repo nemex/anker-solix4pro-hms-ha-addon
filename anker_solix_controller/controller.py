@@ -343,6 +343,7 @@ def main():
     calib_days                = float(opts.get("calibration_days", 15))
     solix_ip                  = opts["solix_ip"]
     shelly_ip                 = opts["shelly_ip"]
+    anker_smart_meter_active  = bool(opts.get("anker_smart_meter_active", False))
 
     client = get_modbus_client(solix_ip)
 
@@ -417,7 +418,8 @@ def main():
             if not watchdog_ok:
                 log.warning("Watchdog Fehler! Grid-Sensor und Shelly-Direktzugriff offline — Sicherheits-Stopp.")
                 # Solarbank auf Self-Consumption-Modus (0) setzen, damit sie sich selbst regelt
-                write_holding_uint16(client, 10064, 0)
+                if not anker_smart_meter_active:
+                    write_holding_uint16(client, 10064, 0)
                 # Hoymiles voll öffnen
                 ha_set_number(hms_2000_entity, 2000)
                 state["last_hms_limit"] = 2000.0
@@ -551,6 +553,7 @@ def main():
                 and not sun_above
                 and solix_soc < 100
                 and state["active_mode"] != "calibration"
+                and not anker_smart_meter_active
             )
             if zwangsladung_trigger:
                 log.info("Zwangsladung gestartet! %.1f Tage seit letzter Kalibrierung", tage_seit)
@@ -576,7 +579,9 @@ def main():
             # ------------------------------------------------------------------
             # 5. Sonnenstand & Moduswechsel
             # ------------------------------------------------------------------
-            if not sun_above:
+            if anker_smart_meter_active:
+                state["active_mode"] = "smart_meter"
+            elif not sun_above:
                 state["active_mode"] = "night"
             else:
                 state["active_mode"] = "active"
@@ -617,7 +622,10 @@ def main():
             # (weil er voll ist oder das Setpoint-Limit erreicht hat), müssen wir den Hoymiles drosseln
             if grid_error < -50:
                 # Kann der Akku noch mehr Ladeleistung aufnehmen?
-                akku_kann_laden = (solix_soc < soc_normal_max) and (setpoint_new_rounded > -solix_max_charge)
+                if anker_smart_meter_active:
+                    akku_kann_laden = (solix_soc < soc_normal_max)
+                else:
+                    akku_kann_laden = (solix_soc < soc_normal_max) and (setpoint_new_rounded > -solix_max_charge)
                 if not akku_kann_laden:
                     # Drosselung erforderlich
                     hms_limit_new = hms_limit_last + grid_error * 0.5
@@ -631,14 +639,19 @@ def main():
             # ------------------------------------------------------------------
             # 7. Hardware ansteuern (Modbus & HA)
             # ------------------------------------------------------------------
-            # 1. Sicherstellen, dass Operating Mode auf 3 (Third-Party Control) steht
-            current_mode = read_holding_uint16(client, 10064)
-            if current_mode != 3:
-                log.info("Setze Betriebsmodus auf Third-Party Control (Mode 3)...")
-                write_holding_uint16(client, 10064, 3)
+            if not anker_smart_meter_active:
+                # 1. Sicherstellen, dass Operating Mode auf 3 (Third-Party Control) steht
+                current_mode = read_holding_uint16(client, 10064)
+                if current_mode != 3:
+                    log.info("Setze Betriebsmodus auf Third-Party Control (Mode 3)...")
+                    write_holding_uint16(client, 10064, 3)
 
-            # 2. Setpoint über Modbus an den Anker schreiben
-            write_holding_int32(client, 10071, int(setpoint_new_rounded))
+                # 2. Setpoint über Modbus an den Anker schreiben
+                write_holding_int32(client, 10071, int(setpoint_new_rounded))
+            else:
+                # Im Smart-Meter-Modus regelt die Solarbank über den Anker Smart Meter.
+                # Wir lesen nur Werte und überspringen das Senden von Sollwerten.
+                pass
 
             # 3. Hoymiles limit über HA setzen (nur bei Änderungen >= 50W)
             if hms_online:
@@ -696,8 +709,9 @@ def main():
     # Shutdown-Safe-State
     log.info("Shutdown — übergebe an Geräte-Selbstregelung...")
     try:
-        # Betriebsmodus auf Self-Consumption (0) setzen, damit das Gerät selbst regelt
-        write_holding_uint16(client, 10064, 0)
+        if not anker_smart_meter_active:
+            # Betriebsmodus auf Self-Consumption (0) setzen, damit das Gerät selbst regelt
+            write_holding_uint16(client, 10064, 0)
         ha_set_number(hms_2000_entity, 2000)
     except Exception as e:
         log.error("Fehler beim Shutdown-Safe-State: %s", e)

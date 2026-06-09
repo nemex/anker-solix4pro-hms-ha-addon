@@ -40,6 +40,7 @@ options:
   manual_feed_in_target: 0.5
   manual_feed_in_min_soc: 90.0
   manual_feed_in_power: 800
+  anker_smart_meter_active: false
 schema:
   shelly_ip: str
   solix_ip: str
@@ -56,3 +57,4 @@ schema:
   manual_feed_in_target: float
   manual_feed_in_min_soc: float
   manual_feed_in_power: int
+  anker_smart_meter_active: bool
