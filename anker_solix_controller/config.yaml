@@ -16,14 +16,14 @@ homeassistant_api: true
 hassio_api: true
 host_network: false
 ingress: true
-ingress_port: 8765
+ingress_port: 8766
 panel_icon: mdi:solar-power-variant
 panel_title: Anker Solix
-watchdog: "http://[HOST]:[PORT:8765]/state"
+watchdog: "http://[HOST]:[PORT:8766]/state"
 ports:
-  8765/tcp: 8765
+  8766/tcp: 8766
 ports_description:
-  8765/tcp: Web UI (direkter Zugriff, optional — Ingress ist aktiv)
+  8766/tcp: Web UI (direkter Zugriff, optional — Ingress ist aktiv)
 options:
   shelly_ip: "192.168.178.98"
   solix_ip: "192.168.178.95"

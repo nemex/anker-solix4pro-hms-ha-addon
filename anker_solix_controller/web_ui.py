@@ -26,6 +26,6 @@ class UIHandler(BaseHTTPRequestHandler):
             self.end_headers()
 
 if __name__ == "__main__":
-    server = ThreadingHTTPServer(("0.0.0.0", 8765), UIHandler)
-    print("Web UI läuft auf http://0.0.0.0:8765")
+    server = ThreadingHTTPServer(("0.0.0.0", 8766), UIHandler)
+    print("Web UI läuft auf http://0.0.0.0:8766")
     server.serve_forever()
