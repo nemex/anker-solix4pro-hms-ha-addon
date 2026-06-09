@@ -1,0 +1,40 @@
+name: Anker Solix 4 Pro Controller
+version: "1.0.0"
+slug: anker_solix_controller
+description: >
+  Zero-feed-in controller for Anker Solix 2/3/4 Pro with Hoymiles HMS inverters.
+url: https://github.com/nemex/anker-solix4pro-hms-ha-addon
+arch:
+  - aarch64
+  - amd64
+  - armhf
+  - armv7
+  - i386
+startup: application
+boot: auto
+homeassistant_api: true
+hassio_api: true
+host_network: false
+ingress: true
+ingress_port: 8765
+panel_icon: mdi:solar-power-variant
+panel_title: Anker Solix
+watchdog: "http://[HOST]:[PORT:8765]/state"
+ports:
+  8765/tcp: 8765
+ports_description:
+  8765/tcp: Web UI (direkter Zugriff, optional — Ingress ist aktiv)
+options:
+  shelly_ip: "192.168.178.98"
+  solix_ip: "192.168.178.95"
+  grid_sensor: "sensor.shellypro3em_leistung"
+  soc_sensor: "sensor.anker_solix_soc"
+  hms_2000_entity: "number.hoymiles_hms_2000_4t_limit_nonpersistent_absolute"
+  dry_run: true
+schema:
+  shelly_ip: str
+  solix_ip: str
+  grid_sensor: str
+  soc_sensor: str
+  hms_2000_entity: str
+  dry_run: bool

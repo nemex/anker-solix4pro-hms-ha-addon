@@ -1,0 +1,18 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+ENV/
+.env
+.venv
+
+# Home Assistant Add-on local run data
+/data/
+controller_state.json
+controller_log.csv
+Log/
+*.log
+*.csv
