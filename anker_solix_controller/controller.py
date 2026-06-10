@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Anker Solix 4 Pro Controller v1.0.0
+Anker Solix 4 Pro Controller v1.1.0
 ===================================
 Zero-feed-in controller for Anker Solix 4 Pro with Hoymiles HMS inverters.
 
@@ -317,7 +317,7 @@ def write_holding_int32(client: ModbusClient, address: int, value: int) -> bool:
 # ---------------------------------------------------------------------------
 def main():
     global DRY_RUN, RUNNING
-    log.info("Anker Solix 4 Pro Controller v1.0.0 startet...")
+    log.info("Anker Solix 4 Pro Controller v1.1.0 startet...")
     
     signal.signal(signal.SIGTERM, _handle_term)
     signal.signal(signal.SIGINT, _handle_term)

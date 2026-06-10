@@ -1,5 +1,5 @@
 name: Anker Solix 4 Pro Controller
-version: "1.0.0"
+version: "1.1.0"
 slug: anker_solix_controller
 description: >
   Zero-feed-in controller for Anker Solix 4 Pro with Hoymiles HMS inverters.
