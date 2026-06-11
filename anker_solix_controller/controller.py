@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Anker Solix 4 Pro Controller v1.2.0
+Anker Solix 4 Pro Controller v1.3.0
 ===================================
 Hybrid zero-feed-in controller for Anker Solix 4 Pro + Hoymiles HMS-2000 & HMS-1600.
 
@@ -8,9 +8,20 @@ Regelkonzept (Hybrid-Modus):
 - Die Solarbank 4 Pro regelt sich autark über das Anker Smart Meter Gen 2.
 - Dieses Add-on liest die Solarbank-Werte rein passiv (read-only) über Modbus TCP (Port 502) aus.
 - Das Add-on steuert die Hoymiles-Wechselrichter (HMS-2000 & optional HMS-1600) über Home Assistant.
-- Wenn der Akku voll ist (SOC >= soc_normal_max), wird der Hoymiles-Überschuss gedrosselt, falls Einspeisung droht.
-- Die Drosselung wird dynamisch auf beide Inverter aufgeteilt, proportional zu ihrer aktuellen Solarerzeugung (calc_hms_limits).
-- Watchdog: Bei Ausfall der Sensoren werden die Hoymiles-Limits komplett geöffnet.
+- Die Drosselung wird dynamisch auf beide Inverter aufgeteilt, proportional zur Ist-Erzeugung.
+
+Änderungen v1.3.0:
+- Drossel-Trigger: anhaltende Einspeisung am Shelly (3 Ticks < -20W) statt SOC-Schwelle.
+  Deckt damit auch den Fall ab, dass die Solarbank ihre maximale Ladeleistung erreicht
+  hat, bevor der Akku voll ist.
+- Release-Deadlock behoben: HMS-Freigabe reagiert jetzt auch auf die Anker-Entladeleistung
+  (solix_ac_output). Wenn der Akku das Haus versorgt, obwohl HMS gedrosselt ist, wird
+  freigegeben — Solar hat Vorrang vor Akku.
+- Watchdog Fail-Safe: Bei Zähler-Ausfall und hohem SOC werden die HMS-Limits eingefroren
+  statt voll geöffnet (Nulleinspeisungs-Garantie). Nur bei niedrigem SOC wird geöffnet,
+  weil der Akku den Überschuss dann sicher aufnehmen kann.
+- Virtuelle Sensoren werden auch im Dry-Run an HA gepusht (read-only, ungefährlich).
+- soc_min entfernt — den Entladeschutz macht die Solarbank selbst.
 """
 
 import json
@@ -40,6 +51,14 @@ OPTIONS_PATH = "/data/options.json"
 STATE_PATH   = "/data/controller_state.json"
 CSV_PATH     = "/data/controller_log.csv"
 TICK_S       = 5
+
+# Regelkonstanten
+GRID_TARGET_W           = 10.0    # Kleiner Netzbezug-Sollwert gegen minimale Einspeisung
+FEED_IN_THRESHOLD_W     = -20.0   # Ab dieser Einspeisung gilt der Tick als "Einspeisung"
+RELEASE_GRID_W          = 20.0    # Netzbezug, ab dem freigegeben wird
+RELEASE_DISCHARGE_W     = 25.0    # Anker-Entladung, ab der freigegeben wird (Solar vor Akku)
+FEED_IN_TICKS_REQUIRED  = 3       # Anzahl Ticks (à 5s) Einspeisung, bevor Drosselung startet
+DAMPING                 = 0.5     # Regel-Dämpfungsfaktor (bewährt aus SunEnergyXT v1.9.2)
 
 def load_options() -> dict:
     with open(OPTIONS_PATH) as f:
@@ -195,8 +214,8 @@ def ha_set_number(entity_id: str, value: float) -> bool:
         return False
 
 def ha_push_sensor(entity_id: str, value: float, unit: str = "W", device_class: str = "power", friendly_name: str = "") -> bool:
-    if DRY_RUN:
-        return True
+    # Sensor-Pushes sind read-only und laufen bewusst auch im Dry-Run,
+    # damit die virtuellen Sensoren beim Testen in HA sichtbar sind.
     try:
         payload = {
             "state": str(round(value, 1)),
@@ -234,7 +253,7 @@ def shelly_direct_power(ip: str):
     return None
 
 # ---------------------------------------------------------------------------
-# Modbus TCP Hilfsfunktionen (Anker Solix 4 Pro)
+# Modbus TCP Hilfsfunktionen (Anker Solix 4 Pro, read-only)
 # ---------------------------------------------------------------------------
 def get_modbus_client(ip: str) -> ModbusClient:
     return ModbusClient(host=ip, port=502, auto_open=True, auto_close=True)
@@ -309,17 +328,17 @@ def calc_hms_limits(
 # ---------------------------------------------------------------------------
 def main():
     global DRY_RUN, RUNNING
-    log.info("Anker Solix 4 Pro Controller v1.2.0 startet...")
-    
+    log.info("Anker Solix 4 Pro Controller v1.3.0 startet...")
+
     signal.signal(signal.SIGTERM, _handle_term)
     signal.signal(signal.SIGINT, _handle_term)
-    
+
     opts  = load_options()
     state = load_state()
 
     DRY_RUN = bool(opts.get("dry_run", True))
     if DRY_RUN:
-        log.info("DRY-RUN Modus aktiv - es wird nichts an Home Assistant gesendet!")
+        log.info("DRY-RUN Modus aktiv - Inverter-Limits werden NICHT gesetzt (Sensoren werden gepusht).")
     else:
         log.info("Aktiver Modus - Steuerung drosselt Inverter in Home Assistant.")
 
@@ -333,7 +352,7 @@ def main():
     hms_2000_entity           = opts["hms_2000_entity"]
     hms_2000_power_sensor     = opts.get("hms_2000_power_sensor", "sensor.hoymiles_hms_2000_4t_power")
     hms_2000_reachable_sensor = opts.get("hms_2000_reachable_sensor", "binary_sensor.hoymiles_hms_2000_4t_reachable")
-    
+
     hms_1600_entity           = opts.get("hms_1600_entity", "")
     hms_1600_power_sensor     = opts.get("hms_1600_power_sensor", "")
     hms_1600_reachable_sensor = opts.get("hms_1600_reachable_sensor", "")
@@ -361,8 +380,9 @@ def main():
     solix_ac_output = 0.0
     solix_load_p = 0.0
 
-    # Trägheitstakt für periodische Updates
+    # Trägheitstakt für periodische Updates & Einspeisungs-Zähler
     is_tick = 0
+    feed_in_ticks = 0
 
     while RUNNING:
         try:
@@ -423,22 +443,30 @@ def main():
                     watchdog_ok = True
                     log.warning("HA-API/Grid-Sensor stale — direkt vom Shelly gelesen: %.0fW", direct_p)
 
-            # Sicherheits-Stopp bei Ausfall des Zählers (Hoymiles voll öffnen)
+            # ------------------------------------------------------------------
+            # 1b. Watchdog Fail-Safe bei Zähler-Ausfall
+            # ------------------------------------------------------------------
+            # Nulleinspeisungs-Garantie: Ohne Messung dürfen die Limits nur dann
+            # geöffnet werden, wenn der Akku den Überschuss sicher aufnehmen kann.
             if not watchdog_ok:
-                log.warning("Watchdog Fehler! Zählerwerte eingefroren — öffne Limits zur Sicherheit.")
-                if hms_2000_online:
-                    ha_set_number(hms_2000_entity, 2000)
-                    state["last_hms_2000_lim"] = 2000.0
-                if has_1600 and hms_1600_online:
-                    ha_set_number(hms_1600_entity, 1600)
-                    state["last_hms_1600_lim"] = 1600.0
-                state["last_hms_limit"] = 3600.0 if has_1600 else 2000.0
+                if solix_soc >= (soc_normal_max - 2.0):
+                    log.warning("Watchdog Fehler bei hohem SOC (%.1f%%) — HMS-Limits werden eingefroren (Fail-Safe).", solix_soc)
+                    # Bewusst NICHTS ändern: letzte Limits bleiben aktiv.
+                else:
+                    log.warning("Watchdog Fehler bei SOC %.1f%% — Akku kann Überschuss aufnehmen, öffne HMS-Limits.", solix_soc)
+                    if hms_2000_online:
+                        ha_set_number(hms_2000_entity, 2000)
+                        state["last_hms_2000_lim"] = 2000.0
+                    if has_1600 and hms_1600_online:
+                        ha_set_number(hms_1600_entity, 1600)
+                        state["last_hms_1600_lim"] = 1600.0
+                    state["last_hms_limit"] = 3600.0 if has_1600 else 2000.0
                 save_state(state)
                 sleep_tick(TICK_S)
                 continue
 
             # ------------------------------------------------------------------
-            # 2. Modbus-Daten vom Anker Solix 4 Pro lesen
+            # 2. Modbus-Daten vom Anker Solix 4 Pro lesen (read-only)
             # ------------------------------------------------------------------
             soc_mb = read_input_uint16(client, 10014)
             if soc_mb is not None:
@@ -460,11 +488,14 @@ def main():
                 pv_3rd = read_input_int32(client, 10004)
                 if pv_3rd is not None:
                     solix_pv += float(pv_3rd)
-            
+
             bat_p_mb = read_input_int32(client, 10008)
             if bat_p_mb is not None:
                 solix_battery_p = float(bat_p_mb)
 
+            # TODO: Register 10208 (AC-Ausgang) gegen offizielle Anker-Registermap
+            # verifizieren, sobald diese veröffentlicht ist. Vorzeichen-Konvention:
+            # positiv = Einspeisung ins Hausnetz (Entladung), negativ = AC-Laden.
             ac_out_mb = read_input_int32(client, 10208)
             if ac_out_mb is not None:
                 solix_ac_output = float(ac_out_mb)
@@ -479,24 +510,23 @@ def main():
             haus_p = max(0.0, grid_p_raw + solar_p_inverters + solix_ac_output)
 
             # ------------------------------------------------------------------
-            # 4. Sonnenstand & Moduswahl
+            # 4. Sonnenstand
             # ------------------------------------------------------------------
-            # Prüfen ob Sonne oben ist (über HA Sun-Modul oder einfach tagsüber)
             sun_above = (ha_get_state("sun.sun", "below_horizon") == "above_horizon") or (solix_pv > 10.0) or (solar_p_inverters > 10.0)
-
-            if not sun_above:
-                state["active_mode"] = "night"
-            elif solix_soc >= soc_normal_max:
-                state["active_mode"] = "drosselung"
-            else:
-                state["active_mode"] = "smart_meter"
 
             # ------------------------------------------------------------------
             # 5. Drosselungsregelung
             # ------------------------------------------------------------------
-            # Der Netzbezug-Sollwert ist 10W, um eine minimale Einspeisung zu verhindern.
-            grid_target = 10.0
-            grid_error = grid_p_raw - grid_target
+            grid_error = grid_p_raw - GRID_TARGET_W
+
+            # Einspeisungs-Zähler: Drosselung startet erst nach anhaltender
+            # Einspeisung (FEED_IN_TICKS_REQUIRED Ticks), um auf kurze
+            # Lastwechsel-Transienten nicht zu reagieren — die fängt der
+            # Anker Smart Meter selbst ab.
+            if grid_p_raw < FEED_IN_THRESHOLD_W:
+                feed_in_ticks += 1
+            else:
+                feed_in_ticks = 0
 
             # Maximal mögliches Limit der aktiven Inverter ermitteln
             max_limit = (2000.0 if hms_2000_online else 0.0) + (1600.0 if hms_1600_online else 0.0)
@@ -506,21 +536,51 @@ def main():
             hms_limit_last = float(state.get("last_hms_limit", max_limit))
             hms_limit_new = hms_limit_last
 
-            # Drossel-Auslöser: Wenn der Akku voll ist und Einspeisung vorliegt
-            if state["active_mode"] == "drosselung":
-                # Empfindlicher Schwellwert von -20W im Smart-Meter-Modus
-                if grid_error < -20.0:
-                    # Einspeisung: Hoymiles drosseln
-                    hms_limit_new = hms_limit_last + grid_error * 0.5
-                elif grid_error > 20.0:
-                    # Netzbezug: Hoymiles freigeben
-                    hms_limit_new = hms_limit_last + grid_error * 0.5
-            else:
-                # Akku nicht voll: Beide Inverter voll öffnen, damit Anker Smart Meter den Überschuss einlagern kann.
+            # Sind wir bereits am Drosseln?
+            throttling_active = hms_limit_last < (max_limit - 10.0)
+
+            if not sun_above:
+                # Nachts: Limits voll öffnen (HMS produziert ohnehin nichts,
+                # so starten sie morgens ungebremst)
                 hms_limit_new = max_limit
+
+            elif throttling_active:
+                # Aktive Regelung — jeder Tick wird nachgeführt:
+                if grid_error < FEED_IN_THRESHOLD_W:
+                    # Einspeisung: weiter drosseln
+                    hms_limit_new = hms_limit_last + grid_error * DAMPING
+                elif solix_ac_output > RELEASE_DISCHARGE_W:
+                    # Anker entlädt den Akku, obwohl HMS gedrosselt ist
+                    # → Solar vor Akku: HMS proportional zur Entladung freigeben.
+                    # Wichtig: grid_error allein würde hier nie ansprechen, weil
+                    # der Anker Smart Meter das Netz auf ~0W hält (Release-Deadlock).
+                    hms_limit_new = hms_limit_last + solix_ac_output * DAMPING
+                elif grid_error > RELEASE_GRID_W:
+                    # Netzbezug (z.B. Anker an Entladegrenze oder Modbus offline):
+                    # ebenfalls freigeben
+                    hms_limit_new = hms_limit_last + grid_error * DAMPING
+
+            else:
+                # Nicht gedrosselt: Nur bei ANHALTENDER Einspeisung eingreifen.
+                # Egal warum sie auftritt — Akku voll, Ladegrenze erreicht oder
+                # Anker-Eigenheit — der Shelly am Netzanschluss ist die Wahrheit.
+                if feed_in_ticks >= FEED_IN_TICKS_REQUIRED:
+                    log.info("Anhaltende Einspeisung erkannt (%.0fW, SOC %.1f%%) — starte HMS-Drosselung.",
+                             grid_p_raw, solix_soc)
+                    hms_limit_new = hms_limit_last + grid_error * DAMPING
+                else:
+                    hms_limit_new = max_limit
 
             hms_limit_new = max(0.0, min(max_limit, hms_limit_new))
             hms_limit_new_rounded = round(hms_limit_new / 10.0) * 10.0
+
+            # Modus ableiten (für Log / UI)
+            if not sun_above:
+                state["active_mode"] = "night"
+            elif hms_limit_new_rounded < (max_limit - 50.0):
+                state["active_mode"] = "drosselung"
+            else:
+                state["active_mode"] = "smart_meter"
 
             # Dynamic actual-production ratio splitting
             limit_2000, limit_1600 = calc_hms_limits(
@@ -528,13 +588,13 @@ def main():
                 hms_2000_online, hms_1600_online
             )
 
-            # Drossel-Status für Log / UI ermitteln
+            # Drossel-Status für periodisches Nachsenden ermitteln
             drosseln = (hms_limit_new_rounded < max_limit - 100.0) and (solar_p_inverters >= hms_limit_new_rounded - 150.0)
 
             # ------------------------------------------------------------------
-            # 6. Inverter limits über Home Assistant setzen
+            # 6. Inverter-Limits über Home Assistant setzen
             # ------------------------------------------------------------------
-            do_is_update = (is_tick % 6 == 0) # Alle 30 Sekunden forcieren
+            do_is_update = (is_tick % 6 == 0)  # Alle 30 Sekunden forcieren
 
             if hms_2000_online:
                 last_written_2000 = float(state.get("last_hms_2000_lim", 2000.0))
@@ -550,9 +610,9 @@ def main():
                     if ha_set_number(hms_1600_entity, limit_1600):
                         state["last_hms_1600_lim"] = limit_1600
 
-            log.info("Modus=%s SOC=%.1f%% | HMS-Limit=%dW (HMS-2000: %dW, HMS-1600: %dW) | grid=%.0fW haus=%.0fW solar=%.0fW",
+            log.info("Modus=%s SOC=%.1f%% | HMS-Limit=%dW (HMS-2000: %dW, HMS-1600: %dW) | grid=%.0fW haus=%.0fW solar=%.0fW anker_ac=%.0fW",
                      state["active_mode"], solix_soc, int(hms_limit_new_rounded), int(limit_2000), int(limit_1600),
-                     grid_p_raw, haus_p, solar_p_inverters + solix_pv)
+                     grid_p_raw, haus_p, solar_p_inverters + solix_pv, solix_ac_output)
 
             # ------------------------------------------------------------------
             # 7. Daten speichern & HA Sensoren aktualisieren
@@ -576,7 +636,7 @@ def main():
                 "hms_1600_online": 1 if hms_1600_online else 0,
             })
 
-            # Virtuelle Sensoren an HA pushen
+            # Virtuelle Sensoren an HA pushen (laufen auch im Dry-Run)
             ha_push_sensor("sensor.anker_hausverbrauch", haus_p, "W", "power", "Hausverbrauch (Anker Controller)")
             ha_push_sensor("sensor.anker_grid_p", grid_p_raw, "W", "power", "Netz aktuell (Anker Controller)")
             ha_push_sensor("sensor.anker_solar_p", solix_pv + solar_p_inverters, "W", "power", "Solar gesamt (Anker Controller)")
@@ -585,6 +645,7 @@ def main():
             ha_push_sensor("sensor.anker_solix_pv", solix_pv, "W", "power", "Anker Solix PV Leistung")
             ha_push_sensor("sensor.anker_solix_battery_power", solix_battery_p, "W", "power", "Anker Solix Batterie Leistung")
             ha_push_sensor("sensor.anker_solix_load_power", solix_load_p, "W", "power", "Anker Solix Last Leistung")
+            ha_push_sensor("sensor.anker_hms_limit", hms_limit_new_rounded, "W", "power", "HMS Gesamt-Limit (Anker Controller)")
 
             state["grid_p_filtered"] = grid_p_raw
             state["solar_p_last"]    = solar_p_inverters
