@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Anker Solix 4 Pro Controller — Web UI
+Anker Solix 4 Pro Controller — Web UI v1.2.0
 Port 8766:
   GET /        → Live Dashboard mit Chart
   GET /state   → JSON State
@@ -13,7 +13,6 @@ import csv
 import json
 import os
 import time
-import requests
 from pathlib import Path
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 
@@ -76,13 +75,9 @@ HTML = """<!DOCTYPE html>
   .card-value.neg { color: var(--red); }
   .card-value.warn { color: var(--accent); }
   .mode { display: inline-block; padding: 3px 10px; border-radius: 3px; font-size: 11px; font-family: var(--mono); }
-  .mode.active { background: rgba(0,230,118,0.15); color: var(--green); border: 1px solid var(--green); }
-  .mode.soc_full { background: rgba(240,165,0,0.15); color: var(--accent); border: 1px solid var(--accent); }
-  .mode.night { background: rgba(74,85,104,0.3); color: var(--muted); border: 1px solid var(--muted); }
-  .mode.calibration { background: rgba(236,72,153,0.15); color: #ec4899; border: 1px solid #ec4899; }
-  .mode.feed_in { background: rgba(0,194,255,0.15); color: var(--blue); border: 1px solid var(--blue); }
-  .mode.feed_in_standby { background: rgba(240,165,0,0.15); color: var(--accent); border: 1px solid var(--accent); }
   .mode.smart_meter { background: rgba(0,194,255,0.15); color: var(--blue); border: 1px solid var(--blue); }
+  .mode.drosselung { background: rgba(240,165,0,0.15); color: var(--accent); border: 1px solid var(--accent); }
+  .mode.night { background: rgba(74,85,104,0.3); color: var(--muted); border: 1px solid var(--muted); }
   .soc-bar { height: 5px; background: var(--border); border-radius: 3px; margin-top: 6px; overflow: hidden; }
   .soc-fill { height: 100%; background: var(--green); border-radius: 3px; transition: width 1s; }
   .chart-wrap { background: var(--surface); border: 1px solid var(--border); border-radius: 4px; padding: 16px; margin-bottom: 20px; }
@@ -96,18 +91,17 @@ HTML = """<!DOCTYPE html>
 </style>
 </head>
 <body>
-<h1>⚡ Anker Solix 4 Pro Controller</h1>
-
+<h1>⚡ Anker Solix 4 Pro Controller (Hybrid)</h1>
+ 
 <div class="grid" id="cards">
-  <div class="card"><div class="card-title">Modus</div><div id="c-mode" class="mode night">—</div></div>
+  <div class="card"><div class="card-title">Modus</div><div id="c-mode" class="mode smart_meter">—</div></div>
   <div class="card"><div class="card-title">Netz</div><div id="c-grid" class="card-value">— W</div></div>
   <div class="card"><div class="card-title">Haus</div><div id="c-haus" class="card-value">— W</div></div>
   <div class="card"><div class="card-title">Solar (Gesamt)</div><div id="c-solar" class="card-value">— W</div></div>
   <div class="card"><div class="card-title">Anker PV Leistung</div><div id="c-anker-pv" class="card-value">— W</div></div>
-  <div class="card"><div class="card-title">Anker Setpoint</div><div id="c-setpoint" class="card-value">— W</div></div>
   <div class="card"><div class="card-title">Anker Batterie</div><div id="c-battery-p" class="card-value">— W</div></div>
-  <div class="card"><div class="card-title">HMS-2000 Limit</div><div id="c-hms-lim" class="card-value">— W</div></div>
-  <div class="card"><div class="card-title">HMS-2000 Ist</div><div id="c-hms-pow" class="card-value">— W</div></div>
+  <div class="card"><div class="card-title">Hoymiles Limit</div><div id="c-hms-lim" class="card-value">— W</div></div>
+  <div class="card"><div class="card-title">Hoymiles Ist</div><div id="c-hms-pow" class="card-value">— W</div></div>
   <div class="card">
     <div class="card-title">SOC</div>
     <div id="c-soc" class="card-value">— %</div>
@@ -121,7 +115,7 @@ HTML = """<!DOCTYPE html>
 </div>
 
 <div class="chart-wrap">
-  <h2>Solar / Haus / Setpoint / HMS-Limit</h2>
+  <h2>Solar / Haus / Hoymiles-Limit</h2>
   <canvas id="chart-power"></canvas>
 </div>
 
@@ -136,7 +130,7 @@ HTML = """<!DOCTYPE html>
       <div style="font-size:10px;color:#4a5568;letter-spacing:2px;text-transform:uppercase;margin-bottom:6px">Anker Solarbank 4 Pro</div>
       <div style="display:flex;justify-content:space-between;margin-bottom:2px">
         <span style="font-size:11px;color:#cdd9e5">PV-Leistung: <span id="inv-se-ist">—</span> W</span>
-        <span style="font-size:11px;color:#4a5568">Setpoint: <span id="inv-se-lim">—</span> W</span>
+        <span style="font-size:11px;color:#4a5568">Akkustrom: <span id="inv-se-bat">—</span> W</span>
       </div>
       <div style="height:8px;background:#1e2d3d;border-radius:4px;overflow:hidden;margin-bottom:4px">
         <div id="inv-se-bar" style="height:100%;background:#00e676;border-radius:4px;width:0%;transition:width 1s"></div>
@@ -144,7 +138,7 @@ HTML = """<!DOCTYPE html>
       <div id="inv-se-reason" style="font-size:10px;color:#4a5568">—</div>
     </div>
     <div>
-      <div style="font-size:10px;color:#4a5568;letter-spacing:2px;text-transform:uppercase;margin-bottom:6px">Hoymiles HMS-2000</div>
+      <div style="font-size:10px;color:#4a5568;letter-spacing:2px;text-transform:uppercase;margin-bottom:6px">Hoymiles Inverter (Gesamt)</div>
       <div style="display:flex;justify-content:space-between;margin-bottom:2px">
         <span style="font-size:11px;color:#cdd9e5">Ist: <span id="inv-2000-ist">—</span> W</span>
         <span style="font-size:11px;color:#4a5568">Limit: <span id="inv-2000-lim">—</span> W</span>
@@ -166,7 +160,7 @@ HTML = """<!DOCTYPE html>
 <script>
 const chartColors = {
   grid: '#ff3d57', haus: '#00c2ff', solar: '#f0a500',
-  setpoint: '#00e676', hms: '#7c3aed'
+  hms: '#7c3aed'
 };
 
 function makeChart(id, datasets, yLabel) {
@@ -192,36 +186,31 @@ const gridChart = makeChart('chart-grid', [
 const powerChart = makeChart('chart-power', [
   { label: 'Solar gesamt (W)', data: [], borderColor: chartColors.solar, tension: 0.3, pointRadius: 0 },
   { label: 'Haus (W)', data: [], borderColor: chartColors.haus, tension: 0.3, pointRadius: 0 },
-  { label: 'Anker Setpoint (W)', data: [], borderColor: chartColors.setpoint, tension: 0.3, pointRadius: 0, borderDash: [4,2] },
-  { label: 'HMS Limit (W)', data: [], borderColor: chartColors.hms, tension: 0.3, pointRadius: 0, borderDash: [4,2] },
+  { label: 'Hoymiles Limit (W)', data: [], borderColor: chartColors.hms, tension: 0.3, pointRadius: 0, borderDash: [4,2] }
 ], 'Watt');
 
 function updateCards(state, csv) {
-  let mode = state.active_mode || 'night';
-  const socNow = parseFloat(csv.soc !== undefined ? csv.soc : (state.soc || 0));
-  const socMax = parseFloat(state.soc_normal_max || 95);
-  if (mode === 'active' && socNow >= socMax) {
-    mode = 'soc_full';
-  }
+  let mode = state.active_mode || 'smart_meter';
   const el = document.getElementById('c-mode');
-  el.textContent = { active: 'AKTIV REGELND', soc_full: 'SOC VOLL', night: 'NACHT', calibration: 'ZWANGSLADUNG', feed_in: 'EINSPEISUNG AKTIV', feed_in_standby: 'EINSPEISUNG STANDBY', smart_meter: 'SMART METER REGELUNG' }[mode] || mode.toUpperCase();
+  el.textContent = { smart_meter: 'SMART METER REGELUNG', drosselung: 'AKKU VOLL / DROSSELUNG', night: 'NACHT' }[mode] || mode.toUpperCase();
   el.className = 'mode ' + mode;
 
   const grid = parseFloat(csv.grid_p || state.grid_p_filtered || 0);
-  setCard('c-grid', grid.toFixed(0) + ' W', grid > 50 ? 'neg' : grid < -30 ? 'pos' : '');
+  setCard('c-grid', grid.toFixed(0) + ' W', grid > 50 ? 'neg' : grid < -20 ? 'pos' : '');
   setCard('c-haus', parseFloat(csv.haus_p || state.haus_p_last || 0).toFixed(0) + ' W', '');
   setCard('c-solar', parseFloat(csv.solar_p || state.solar_p_last || 0).toFixed(0) + ' W', 'pos');
   setCard('c-anker-pv', parseFloat(csv.pv || state.pv_last || 0).toFixed(0) + ' W', 'pos');
-  
-  const setpoint = parseFloat(csv.setpoint !== undefined ? csv.setpoint : (state.last_setpoint || 0));
-  setCard('c-setpoint', setpoint.toFixed(0) + ' W', '');
   
   const battery_p = parseFloat(csv.battery_p || 0);
   setCard('c-battery-p', battery_p.toFixed(0) + ' W', battery_p < 0 ? 'pos' : battery_p > 0 ? 'warn' : '');
   
   const hmsLim = parseFloat(csv.hms_limit !== undefined ? csv.hms_limit : (state.last_hms_limit || 2000));
   setCard('c-hms-lim', hmsLim.toFixed(0) + ' W', '');
-  setCard('c-hms-pow', parseFloat(csv.hms_power || 0).toFixed(0) + ' W', '');
+  
+  const hms2000Power = parseFloat(csv.hms_2000_power || csv.hms_power || 0);
+  const hms1600Power = parseFloat(csv.hms_1600_power || 0);
+  const hmsPow = hms2000Power + hms1600Power;
+  setCard('c-hms-pow', hmsPow.toFixed(0) + ' W', '');
 
   const soc = parseFloat(csv.soc || state.soc || 0);
   setCard('c-soc', soc.toFixed(0) + ' %', soc < 20 ? 'warn' : '');
@@ -230,7 +219,7 @@ function updateCards(state, csv) {
 
   // Status Ist vs Limit
   const seIst = parseFloat(csv.pv || state.pv_last || 0);
-  const hmsIst = parseFloat(csv.hms_power || 0);
+  const maxHms = state.last_hms_limit > 2000 ? 3600 : 2000;
 
   let statusText = '—';
   let seReason = '—', hmsReason = '—';
@@ -239,26 +228,26 @@ function updateCards(state, csv) {
     statusText = '⚪ Nacht — kein aktiver Solarbetrieb';
     seReason = 'Nacht';
     hmsReason = 'Nacht';
-  } else if (mode === 'smart_meter') {
-    statusText = '🔵 Anker Smart Meter aktiv — Solarbank regelt autark';
-    seReason = 'Regelung über Anker Smart Meter';
-    hmsReason = hmsLim < 2000 ? '⬇ Gedrosselt (Überschuss)' : '✅ Offen';
-  } else if (grid < -25) {
-    statusText = '兵 Gedrosselt — Überschuss (' + Math.round(grid) + 'W Einspeisung)';
-    seReason = setpoint < 0 ? '🔋 Lädt mit ' + Math.abs(setpoint) + 'W' : '✅ Volle Freigabe';
-    hmsReason = hmsLim < 2000 ? '⬇ Gedrosselt (Überschuss)' : '✅ Offen';
+  } else if (mode === 'drosselung') {
+    statusText = '⬇ Akku voll — Drosselung aktiv (' + Math.round(grid) + 'W)';
+    seReason = 'Akku voll (regelt autark)';
+    hmsReason = hmsLim < maxHms ? '⬇ Gedrosselt (Überschuss)' : '✅ Offen';
   } else {
-    statusText = '🟢 Nulleinspeisung aktiv (' + Math.round(grid) + 'W)';
-    seReason = setpoint < 0 ? '🔋 Lädt mit ' + Math.abs(setpoint) + 'W' : '✅ Entlädt mit ' + setpoint + 'W';
-    hmsReason = hmsLim < 2000 ? '⬇ Teilweise gedrosselt' : '✅ Offen';
+    statusText = '🟢 Smart Meter Regelung aktiv — Akku lädt (' + Math.round(grid) + 'W)';
+    seReason = battery_p < 0 ? '🔋 Lädt mit ' + Math.abs(battery_p).toFixed(0) + 'W' : '✅ Autarke Regelung';
+    hmsReason = '✅ Offen';
   }
 
   document.getElementById('inv-status').textContent = statusText;
   document.getElementById('inv-se-reason').textContent = seReason;
   document.getElementById('inv-2000-reason').textContent = hmsReason;
 
-  setInv('inv-se',   seIst,   Math.abs(setpoint) || 2500, 2500);
-  setInv('inv-2000', hmsIst,  hmsLim, 2000);
+  document.getElementById('inv-se-ist').textContent = Math.round(seIst);
+  document.getElementById('inv-se-bat').textContent = Math.round(battery_p);
+  const seBarPct = Math.min(100, seIst / 2500 * 100);
+  document.getElementById('inv-se-bar').style.width = seBarPct + '%';
+
+  setInv('inv-2000', hmsPow, hmsLim, maxHms);
 }
 
 function setInv(prefix, ist, lim, max) {
@@ -287,8 +276,7 @@ function updateCharts(rows) {
   powerChart.data.labels = labels;
   powerChart.data.datasets[0].data = rows.map(r => parseFloat(r.solar_p || 0));
   powerChart.data.datasets[1].data = rows.map(r => parseFloat(r.haus_p || 0));
-  powerChart.data.datasets[2].data = rows.map(r => parseFloat(r.setpoint || 0));
-  powerChart.data.datasets[3].data = rows.map(r => parseFloat(r.hms_limit || 0));
+  powerChart.data.datasets[2].data = rows.map(r => parseFloat(r.hms_limit || 0));
   powerChart.update();
 }
 

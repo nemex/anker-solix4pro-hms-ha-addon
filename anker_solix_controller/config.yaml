@@ -1,8 +1,8 @@
 name: Anker Solix 4 Pro Controller
-version: "1.1.0"
+version: "1.2.0"
 slug: anker_solix_controller
 description: >
-  Zero-feed-in controller for Anker Solix 4 Pro with Hoymiles HMS inverters.
+  Zero-feed-in controller for Anker Solix 4 Pro with Hoymiles HMS inverters (HMS-2000 & HMS-1600).
 url: https://github.com/nemex/anker-solix4pro-hms-ha-addon
 arch:
   - aarch64
@@ -32,15 +32,12 @@ options:
   hms_2000_entity: "number.hoymiles_hms_2000_4t_limit_nonpersistent_absolute"
   hms_2000_power_sensor: "sensor.hoymiles_hms_2000_4t_power"
   hms_2000_reachable_sensor: "binary_sensor.hoymiles_hms_2000_4t_reachable"
+  hms_1600_entity: "number.hoymiles_hms_1600_4t_limit_nonpersistent_absolute"
+  hms_1600_power_sensor: "sensor.hoymiles_hms_1600_4t_power"
+  hms_1600_reachable_sensor: "binary_sensor.hoymiles_hms_1600_4t_reachable"
   soc_normal_max: 95
   soc_min: 10
-  calibration_days: 15
   dry_run: true
-  manual_feed_in_switch: "input_boolean.anker_manual_feed_in"
-  manual_feed_in_target: 0.5
-  manual_feed_in_min_soc: 90.0
-  manual_feed_in_power: 800
-  anker_smart_meter_active: false
 schema:
   shelly_ip: str
   solix_ip: str
@@ -49,12 +46,9 @@ schema:
   hms_2000_entity: str
   hms_2000_power_sensor: str
   hms_2000_reachable_sensor: str
+  hms_1600_entity: str
+  hms_1600_power_sensor: str
+  hms_1600_reachable_sensor: str
   soc_normal_max: int
   soc_min: int
-  calibration_days: int
   dry_run: bool
-  manual_feed_in_switch: str
-  manual_feed_in_target: float
-  manual_feed_in_min_soc: float
-  manual_feed_in_power: int
-  anker_smart_meter_active: bool

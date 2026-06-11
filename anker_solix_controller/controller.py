@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
 """
-Anker Solix 4 Pro Controller v1.1.0
+Anker Solix 4 Pro Controller v1.2.0
 ===================================
-Zero-feed-in controller for Anker Solix 4 Pro with Hoymiles HMS inverters.
+Hybrid zero-feed-in controller for Anker Solix 4 Pro + Hoymiles HMS-2000 & HMS-1600.
 
-Regelkonzept:
-- Modbus TCP: Steuerung der Solarbank 4 Pro über Register 10071 (battery_power_setpoint)
-- Home Assistant: Regelung des Hoymiles-Wechselrichters über Limit-Entities
-- Nachts: Setpoint-Regelung basierend auf dem Hausverbrauch (Entladung)
-- Zwangsladung: Alle calibration_days Tage auf 100% zur BMS-Kalibrierung
-- Watchdog: Übergabe an Geräteregelung bei Fehlern (Self-consumption / Mode 0)
+Regelkonzept (Hybrid-Modus):
+- Die Solarbank 4 Pro regelt sich autark über das Anker Smart Meter Gen 2.
+- Dieses Add-on liest die Solarbank-Werte rein passiv (read-only) über Modbus TCP (Port 502) aus.
+- Das Add-on steuert die Hoymiles-Wechselrichter (HMS-2000 & optional HMS-1600) über Home Assistant.
+- Wenn der Akku voll ist (SOC >= soc_normal_max), wird der Hoymiles-Überschuss gedrosselt, falls Einspeisung droht.
+- Die Drosselung wird dynamisch auf beide Inverter aufgeteilt, proportional zu ihrer aktuellen Solarerzeugung (calc_hms_limits).
+- Watchdog: Bei Ausfall der Sensoren werden die Hoymiles-Limits komplett geöffnet.
 """
 
 import json
@@ -19,7 +20,7 @@ import os
 import signal
 import time
 import requests
-from datetime import datetime, timezone, timedelta
+from datetime import datetime
 from pathlib import Path
 from pyModbusTCP.client import ModbusClient
 
@@ -33,7 +34,7 @@ logging.basicConfig(
 log = logging.getLogger("anker_solix_controller")
 
 # ---------------------------------------------------------------------------
-# Konfiguration
+# Konfiguration & Pfade
 # ---------------------------------------------------------------------------
 OPTIONS_PATH = "/data/options.json"
 STATE_PATH   = "/data/controller_state.json"
@@ -52,12 +53,13 @@ def load_state() -> dict:
     except Exception:
         pass
     return {
-        "active_mode": "night",
-        "last_calibration_ts": time.time(),
+        "active_mode": "smart_meter",
+        "last_hms_limit": 3600.0,
+        "last_hms_2000_lim": 2000.0,
+        "last_hms_1600_lim": 1600.0,
         "grid_p_filtered": 0.0,
         "solar_p_last": 0.0,
         "haus_p_last": 0.0,
-        "last_setpoint": 0.0,
         "soc": 0.0,
         "pv_last": 0.0,
     }
@@ -74,8 +76,9 @@ def save_state(state: dict):
 # ---------------------------------------------------------------------------
 CSV_FIELDS = [
     "ts", "mode", "soc", "grid_p", "haus_p", "solar_p",
-    "setpoint", "battery_p", "pv", "load_p", "hms_limit",
-    "hms_power", "hms_online"
+    "battery_p", "pv", "load_p", "hms_limit",
+    "hms_2000_power", "hms_2000_lim", "hms_2000_online",
+    "hms_1600_power", "hms_1600_lim", "hms_1600_online"
 ]
 
 CSV_MAX_BYTES = 2 * 1024 * 1024   # 2 MB
@@ -151,6 +154,8 @@ def save_state_throttled(state: dict, every: int = 6):
         save_state(state)
 
 def ha_get_state(entity_id: str, default=None):
+    if not entity_id or entity_id.lower() in ("none", ""):
+        return default
     try:
         r = HA_SESSION.get(f"{HA_URL}/api/states/{entity_id}", timeout=5)
         if r.status_code == 200:
@@ -162,6 +167,8 @@ def ha_get_state(entity_id: str, default=None):
     return default
 
 def ha_get_full(entity_id: str):
+    if not entity_id or entity_id.lower() in ("none", ""):
+        return None
     try:
         r = HA_SESSION.get(f"{HA_URL}/api/states/{entity_id}", timeout=5)
         if r.status_code == 200:
@@ -171,6 +178,8 @@ def ha_get_full(entity_id: str):
     return None
 
 def ha_set_number(entity_id: str, value: float) -> bool:
+    if not entity_id or entity_id.lower() in ("none", ""):
+        return False
     if DRY_RUN:
         log.info("🔍 [DRY-RUN] WÜRDE setzen: %s = %s", entity_id, round(value, 1))
         return True
@@ -212,6 +221,8 @@ def ha_push_sensor(entity_id: str, value: float, unit: str = "W", device_class: 
 # Shelly Pro 3EM Direkt-Fallback
 # ---------------------------------------------------------------------------
 def shelly_direct_power(ip: str):
+    if not ip or ip.lower() in ("none", ""):
+        return None
     try:
         r = DEV_SESSION.get(f"http://{ip}/rpc/EM.GetStatus?id=0", timeout=3)
         if r.status_code == 200:
@@ -221,15 +232,6 @@ def shelly_direct_power(ip: str):
     except Exception as e:
         log.debug("Shelly Direkt-Fallback Fehler: %s", e)
     return None
-
-# ---------------------------------------------------------------------------
-# Sonnenstand
-# ---------------------------------------------------------------------------
-def get_sun_state() -> dict:
-    data = ha_get_full("sun.sun")
-    if data:
-        return data
-    return {"state": "below_horizon"}
 
 # ---------------------------------------------------------------------------
 # Modbus TCP Hilfsfunktionen (Anker Solix 4 Pro)
@@ -261,63 +263,53 @@ def read_input_int32(client: ModbusClient, address: int) -> int | None:
         log.error("Modbus read input register %d (INT32) error: %s", address, e)
     return None
 
-def read_holding_uint16(client: ModbusClient, address: int) -> int | None:
-    try:
-        regs = client.read_holding_registers(address, 1)
-        if regs:
-            return regs[0]
-    except Exception as e:
-        log.error("Modbus read holding register %d (UINT16) error: %s", address, e)
-    return None
+# ---------------------------------------------------------------------------
+# HMS Limits berechnen (Dynamisch nach Ist-Erzeugung)
+# ---------------------------------------------------------------------------
+def calc_hms_limits(
+    hms_limit_target: float,
+    solar_p_2000: float,
+    solar_p_1600: float,
+    hms_2000_online: bool,
+    hms_1600_online: bool,
+) -> tuple[float, float]:
+    """Teilt das berechnete Gesamt-HMS-Limit stufenlos auf die beiden Inverter auf."""
+    max_2000 = 2000.0
+    max_1600 = 1600.0
 
-def read_holding_int32(client: ModbusClient, address: int) -> int | None:
-    try:
-        regs = client.read_holding_registers(address, 2)
-        if regs and len(regs) == 2:
-            high = regs[0] & 0xFFFF
-            low = regs[1] & 0xFFFF
-            unsigned = (high << 16) | low
-            if unsigned & 0x80000000:
-                return -((~unsigned & 0xFFFFFFFF) + 1)
-            else:
-                return unsigned
-    except Exception as e:
-        log.error("Modbus read holding register %d (INT32) error: %s", address, e)
-    return None
+    if not hms_1600_online:
+        return min(hms_limit_target, max_2000), 0.0
+    if not hms_2000_online:
+        return 0.0, min(hms_limit_target, max_1600)
 
-def write_holding_uint16(client: ModbusClient, address: int, value: int) -> bool:
-    if DRY_RUN:
-        log.info("🔍 [DRY-RUN] Modbus Write holding register %d (UINT16) = %d", address, value)
-        return True
-    try:
-        res = client.write_single_register(address, int(value) & 0xFFFF)
-        return bool(res)
-    except Exception as e:
-        log.error("Modbus write holding register %d (UINT16) error: %s", address, e)
-    return False
+    # Wenn das Gesamtlimit auf Maximum steht, öffnen wir beide voll
+    if hms_limit_target >= 3550.0:
+        return max_2000, max_1600
 
-def write_holding_int32(client: ModbusClient, address: int, value: int) -> bool:
-    if DRY_RUN:
-        log.info("🔍 [DRY-RUN] Modbus Write holding register %d (INT32) = %d", address, value)
-        return True
-    try:
-        int_value = int(value)
-        if int_value < 0:
-            int_value += 0x100000000
-        high = (int_value >> 16) & 0xFFFF
-        low = int_value & 0xFFFF
-        res = client.write_multiple_registers(address, [high, low])
-        return bool(res)
-    except Exception as e:
-        log.error("Modbus write holding register %d (INT32) error: %s", address, e)
-    return False
+    total_solar = solar_p_2000 + solar_p_1600
+
+    if total_solar > 50.0:
+        ratio_2000 = solar_p_2000 / total_solar
+        ratio_1600 = solar_p_1600 / total_solar
+    else:
+        # Fallback auf Nennleistungsverhältnis bei Dunkelheit/Nacht
+        ratio_2000 = 0.55
+        ratio_1600 = 0.45
+
+    limit_2000 = min(round(hms_limit_target * ratio_2000), max_2000)
+    limit_2000 = max(0.0, limit_2000)
+
+    limit_1600 = min(round(hms_limit_target * ratio_1600), max_1600)
+    limit_1600 = max(0.0, limit_1600)
+
+    return limit_2000, limit_1600
 
 # ---------------------------------------------------------------------------
 # Hauptregelschleife
 # ---------------------------------------------------------------------------
 def main():
     global DRY_RUN, RUNNING
-    log.info("Anker Solix 4 Pro Controller v1.1.0 startet...")
+    log.info("Anker Solix 4 Pro Controller v1.2.0 startet...")
     
     signal.signal(signal.SIGTERM, _handle_term)
     signal.signal(signal.SIGINT, _handle_term)
@@ -327,52 +319,55 @@ def main():
 
     DRY_RUN = bool(opts.get("dry_run", True))
     if DRY_RUN:
-        log.info("DRY-RUN Modus aktiv - es wird nichts geschrieben!")
+        log.info("DRY-RUN Modus aktiv - es wird nichts an Home Assistant gesendet!")
     else:
-        log.info("Aktiver Modus - Steuerung schreibt in HA und Modbus")
+        log.info("Aktiver Modus - Steuerung drosselt Inverter in Home Assistant.")
 
     # Konfiguration laden
     grid_sensor               = opts["grid_sensor"]
     soc_sensor                = opts["soc_sensor"]
+    solix_ip                  = opts["solix_ip"]
+    shelly_ip                 = opts["shelly_ip"]
+    soc_normal_max            = float(opts.get("soc_normal_max", 95))
+
     hms_2000_entity           = opts["hms_2000_entity"]
     hms_2000_power_sensor     = opts.get("hms_2000_power_sensor", "sensor.hoymiles_hms_2000_4t_power")
     hms_2000_reachable_sensor = opts.get("hms_2000_reachable_sensor", "binary_sensor.hoymiles_hms_2000_4t_reachable")
     
-    soc_normal_max            = float(opts.get("soc_normal_max", 95))
-    soc_min                   = float(opts.get("soc_min", 10))
-    calib_days                = float(opts.get("calibration_days", 15))
-    solix_ip                  = opts["solix_ip"]
-    shelly_ip                 = opts["shelly_ip"]
-    anker_smart_meter_active  = bool(opts.get("anker_smart_meter_active", False))
+    hms_1600_entity           = opts.get("hms_1600_entity", "")
+    hms_1600_power_sensor     = opts.get("hms_1600_power_sensor", "")
+    hms_1600_reachable_sensor = opts.get("hms_1600_reachable_sensor", "")
+
+    has_1600 = bool(hms_1600_entity and hms_1600_entity.lower() not in ("none", ""))
 
     client = get_modbus_client(solix_ip)
 
     # Initialisierung
-    if "last_calibration_ts" not in state:
-        state["last_calibration_ts"] = time.time()
     if "last_hms_limit" not in state:
-        state["last_hms_limit"] = 2000.0
-    if "manual_feed_in_active" not in state:
-        state["manual_feed_in_active"] = False
-    if "manual_feed_in_accumulated_kwh" not in state:
-        state["manual_feed_in_accumulated_kwh"] = 0.0
+        state["last_hms_limit"] = 3600.0 if has_1600 else 2000.0
+    if "last_hms_2000_lim" not in state:
+        state["last_hms_2000_lim"] = 2000.0
+    if "last_hms_1600_lim" not in state:
+        state["last_hms_1600_lim"] = 1600.0
 
-    state["active_mode"] = "night"
+    state["active_mode"] = "smart_meter"
     save_state(state)
-    log.info("Controller initialisiert, Solix IP=%s, Shelly IP=%s", solix_ip, shelly_ip)
+    log.info("Controller initialisiert. Solix IP=%s, Shelly IP=%s, HMS-1600 aktiv=%s", solix_ip, shelly_ip, has_1600)
 
-    # Lokaler Cache für Modbus-Daten bei Ausfällen
+    # Lokaler Cache für Modbus-Daten bei Verbindungsproblemen
     solix_soc = float(state.get("soc", 50.0))
     solix_pv = 0.0
     solix_battery_p = 0.0
     solix_ac_output = 0.0
     solix_load_p = 0.0
-    solix_max_charge = 2000.0
-    solix_max_discharge = 2500.0
+
+    # Trägheitstakt für periodische Updates
+    is_tick = 0
 
     while RUNNING:
         try:
             tick_start = time.monotonic()
+            is_tick += 1
 
             # ------------------------------------------------------------------
             # 1. Messwerte lesen (Shelly / HA)
@@ -384,17 +379,31 @@ def main():
                 grid_p_raw = float(state.get("grid_p_filtered", 0.0))
                 log.warning("Grid-Sensor (%s) offline — verwende letzten Wert %.0fW", grid_sensor, grid_p_raw)
 
-            # Hoymiles HMS-2000 Leistung lesen
-            hms_power_val = ha_get_state(hms_2000_power_sensor)
-            if hms_power_val not in (None, "unknown", "unavailable"):
-                solar_p_hms = abs(float(hms_power_val))
+            # HMS-2000 Leistung lesen
+            hms_2000_power_val = ha_get_state(hms_2000_power_sensor)
+            if hms_2000_power_val not in (None, "unknown", "unavailable"):
+                solar_p_2000 = abs(float(hms_2000_power_val))
             else:
-                solar_p_hms = float(state.get("solar_p_last", 0.0))
-                log.debug("HMS-2000 Power-Sensor offline — verwende letzten Wert %.0fW", solar_p_hms)
+                solar_p_2000 = float(state.get("hms_2000_power_last", 0.0))
 
-            hms_online = (ha_get_state(hms_2000_reachable_sensor, "off") == "on") or (solar_p_hms > 10.0)
+            hms_2000_online = (ha_get_state(hms_2000_reachable_sensor, "off") == "on") or (solar_p_2000 > 10.0)
 
-            # Watchdog: Überprüfung, ob der Zähler frische Werte liefert
+            # HMS-1600 Leistung lesen
+            solar_p_1600 = 0.0
+            hms_1600_online = False
+            if has_1600:
+                hms_1600_power_val = ha_get_state(hms_1600_power_sensor)
+                if hms_1600_power_val not in (None, "unknown", "unavailable"):
+                    solar_p_1600 = abs(float(hms_1600_power_val))
+                else:
+                    solar_p_1600 = float(state.get("hms_1600_power_last", 0.0))
+
+                hms_1600_online = (ha_get_state(hms_1600_reachable_sensor, "off") == "on") or (solar_p_1600 > 10.0)
+
+            # Gesamt-Solarleistung der Inverter
+            solar_p_inverters = (solar_p_2000 if hms_2000_online else 0.0) + (solar_p_1600 if hms_1600_online else 0.0)
+
+            # Watchdog: Überprüfung, ob der Grid-Zähler frische Werte liefert
             shelly_data = ha_get_full(grid_sensor)
             if shelly_data:
                 last_upd = shelly_data.get("last_updated", "")
@@ -406,23 +415,24 @@ def main():
             else:
                 watchdog_ok = False
 
-            # Sicherheits-Fallback direkt über Shelly IP
-            if not watchdog_ok:
+            # Fallback direkt über Shelly IP
+            if not watchdog_ok and shelly_ip:
                 direct_p = shelly_direct_power(shelly_ip)
                 if direct_p is not None:
                     grid_p_raw = direct_p
                     watchdog_ok = True
                     log.warning("HA-API/Grid-Sensor stale — direkt vom Shelly gelesen: %.0fW", direct_p)
 
-            # Sicherheits-Stopp bei Watchdog-Fehler
+            # Sicherheits-Stopp bei Ausfall des Zählers (Hoymiles voll öffnen)
             if not watchdog_ok:
-                log.warning("Watchdog Fehler! Grid-Sensor und Shelly-Direktzugriff offline — Sicherheits-Stopp.")
-                # Solarbank auf Self-Consumption-Modus (0) setzen, damit sie sich selbst regelt
-                if not anker_smart_meter_active:
-                    write_holding_uint16(client, 10064, 0)
-                # Hoymiles voll öffnen
-                ha_set_number(hms_2000_entity, 2000)
-                state["last_hms_limit"] = 2000.0
+                log.warning("Watchdog Fehler! Zählerwerte eingefroren — öffne Limits zur Sicherheit.")
+                if hms_2000_online:
+                    ha_set_number(hms_2000_entity, 2000)
+                    state["last_hms_2000_lim"] = 2000.0
+                if has_1600 and hms_1600_online:
+                    ha_set_number(hms_1600_entity, 1600)
+                    state["last_hms_1600_lim"] = 1600.0
+                state["last_hms_limit"] = 3600.0 if has_1600 else 2000.0
                 save_state(state)
                 sleep_tick(TICK_S)
                 continue
@@ -430,12 +440,11 @@ def main():
             # ------------------------------------------------------------------
             # 2. Modbus-Daten vom Anker Solix 4 Pro lesen
             # ------------------------------------------------------------------
-            # Verbindung sicherstellen
             soc_mb = read_input_uint16(client, 10014)
             if soc_mb is not None:
                 solix_soc = float(soc_mb)
             else:
-                # Falls Modbus fehlschlägt, versuchen wir das HA-Entity
+                # Fallback über Home Assistant Entity
                 soc_ha = ha_get_state(soc_sensor)
                 if soc_ha not in (None, "unknown", "unavailable"):
                     solix_soc = float(soc_ha)
@@ -446,9 +455,8 @@ def main():
 
             pv_mb = read_input_int32(client, 10002)
             if pv_mb is not None:
-                # Gesamt-PV = PCS PV + 3rd Party PV (falls vorhanden, lesen wir 10002 und addieren)
                 solix_pv = float(pv_mb)
-                # Falls dritter PV-Kanal vorhanden (Adresse 10004)
+                # Dritter Kanal (falls vorhanden, Register 10004)
                 pv_3rd = read_input_int32(client, 10004)
                 if pv_3rd is not None:
                     solix_pv += float(pv_3rd)
@@ -465,238 +473,125 @@ def main():
             if load_p_mb is not None:
                 solix_load_p = float(load_p_mb)
 
-            # Max limits auslesen
-            max_c = read_input_int32(client, 10036)
-            if max_c is not None:
-                solix_max_charge = float(max_c)
-            max_d = read_input_int32(client, 10038)
-            if max_d is not None:
-                solix_max_discharge = float(max_d)
-
-            # Hysterese für SOC Entladeschutz
-            low_soc_active = state.get("low_soc_active", False)
-            if solix_soc <= soc_min:
-                low_soc_active = True
-            elif solix_soc >= (soc_min + 2.0):
-                low_soc_active = False
-            state["low_soc_active"] = low_soc_active
+            # ------------------------------------------------------------------
+            # 3. Hausverbrauch berechnen
+            # ------------------------------------------------------------------
+            haus_p = max(0.0, grid_p_raw + solar_p_inverters + solix_ac_output)
 
             # ------------------------------------------------------------------
-            # 3. Hausverbrauch & manuelle Einspeisung
+            # 4. Sonnenstand & Moduswahl
             # ------------------------------------------------------------------
-            # Hausverbrauch berechnen: Netzleistung + Hoymiles + Solarbank-AC-Ausgang
-            # Hinweis: solix_ac_output ist positiv beim Einspeisen und negativ beim Laden.
-            haus_p = max(0.0, grid_p_raw + (solar_p_hms if hms_online else 0.0) + solix_ac_output)
+            # Prüfen ob Sonne oben ist (über HA Sun-Modul oder einfach tagsüber)
+            sun_above = (ha_get_state("sun.sun", "below_horizon") == "above_horizon") or (solix_pv > 10.0) or (solar_p_inverters > 10.0)
 
-            manual_feed_in_switch  = opts.get("manual_feed_in_switch", "input_boolean.anker_manual_feed_in")
-            manual_feed_in_target  = float(opts.get("manual_feed_in_target", 0.5))
-            manual_feed_in_min_soc = float(opts.get("manual_feed_in_min_soc", 90.0))
-            manual_feed_in_power   = float(opts.get("manual_feed_in_power", 800.0))
-
-            feed_in_active = False
-            if manual_feed_in_switch:
-                feed_in_state = ha_get_state(manual_feed_in_switch, "off")
-                feed_in_active = (feed_in_state == "on")
-
-            grid_target = 10.0  # Kleiner Netzbezug-Sollwert
-            is_actively_feeding_in = False
-
-            if feed_in_active:
-                if not state.get("manual_feed_in_active", False):
-                    state["manual_feed_in_active"] = True
-                    state["manual_feed_in_accumulated_kwh"] = 0.0
-                    log.info("🔋 Manuelle Einspeisung gestartet. Ziel: %.2f kWh", manual_feed_in_target)
-
-                # Überschuss prüfen
-                surplus = (solar_p_hms + solix_pv) - haus_p
-                conditions_met = (solix_soc >= manual_feed_in_min_soc) and (surplus > 0.0)
-                if conditions_met:
-                    is_actively_feeding_in = True
-                    grid_target = -min(manual_feed_in_power, surplus)
-                    if grid_p_raw < 0:
-                        tick_kwh = (-grid_p_raw * TICK_S) / 3600000.0
-                        state["manual_feed_in_accumulated_kwh"] = state.get("manual_feed_in_accumulated_kwh", 0.0) + tick_kwh
-
-                accumulated = state.get("manual_feed_in_accumulated_kwh", 0.0)
-                if accumulated >= manual_feed_in_target:
-                    log.info("🔋 Manuelle Einspeisung Ziel von %.2f kWh erreicht! Schalte ab...", manual_feed_in_target)
-                    if not DRY_RUN:
-                        HA_SESSION.post(
-                            f"{HA_URL}/api/services/input_boolean/turn_off",
-                            json={"entity_id": manual_feed_in_switch},
-                            timeout=5,
-                        )
-                    state["manual_feed_in_active"] = False
-                    state["manual_feed_in_accumulated_kwh"] = 0.0
-                    feed_in_active = False
-                    is_actively_feeding_in = False
-                    grid_target = 10.0
-
-            # ------------------------------------------------------------------
-            # 4. Zwangsladung (BMS Kalibrierung)
-            # ------------------------------------------------------------------
-            tage_seit = (time.time() - state["last_calibration_ts"]) / 86400
-            sun_above = get_sun_state().get("state") == "above_horizon"
-
-            # Kalibrierungs-Fälligkeit prüfen (Ziel: 10:00 Uhr des Ziel-Tages)
-            try:
-                last_cal_dt = datetime.fromtimestamp(state["last_calibration_ts"])
-                target_dt = last_cal_dt + timedelta(days=calib_days)
-                target_10am = target_dt.replace(hour=10, minute=0, second=0, microsecond=0)
-                calibration_due = datetime.now() >= target_10am
-            except Exception as e:
-                log.error("Fehler bei Kalibrierungszeit-Berechnung: %s", e)
-                calibration_due = tage_seit > calib_days
-
-            zwangsladung_trigger = (
-                calibration_due
-                and not sun_above
-                and solix_soc < 100
-                and state["active_mode"] != "calibration"
-                and not anker_smart_meter_active
-            )
-            if zwangsladung_trigger:
-                log.info("Zwangsladung gestartet! %.1f Tage seit letzter Kalibrierung", tage_seit)
-                state["active_mode"] = "calibration"
-                save_state(state)
-
-            if state["active_mode"] == "calibration" and solix_soc < 100:
-                log.info("Zwangsladung läuft... SOC=%.1f%%", solix_soc)
-                # Setpoint auf maximales Laden (negativ)
-                write_holding_uint16(client, 10064, 3)  # Third-party control
-                write_holding_int32(client, 10071, -int(solix_max_charge))
-                ha_set_number(hms_2000_entity, 2000)    # Hoymiles voll offen halten
-                state["last_hms_limit"] = 2000.0
-                sleep_tick(TICK_S)
-                continue
-
-            if state["active_mode"] == "calibration" and solix_soc >= 100:
-                log.info("Zwangsladung erfolgreich abgeschlossen!")
-                state["last_calibration_ts"] = time.time()
-                state["active_mode"] = "active"
-                save_state(state)
-
-            # ------------------------------------------------------------------
-            # 5. Sonnenstand & Moduswechsel
-            # ------------------------------------------------------------------
-            if anker_smart_meter_active:
-                state["active_mode"] = "smart_meter"
-            elif not sun_above:
+            if not sun_above:
                 state["active_mode"] = "night"
+            elif solix_soc >= soc_normal_max:
+                state["active_mode"] = "drosselung"
             else:
-                state["active_mode"] = "active"
+                state["active_mode"] = "smart_meter"
 
             # ------------------------------------------------------------------
-            # 6. Regelungsalgorithmus (Nulleinspeisung)
+            # 5. Drosselungsregelung
             # ------------------------------------------------------------------
-            # Grid Error berechnen
+            # Der Netzbezug-Sollwert ist 10W, um eine minimale Einspeisung zu verhindern.
+            grid_target = 10.0
             grid_error = grid_p_raw - grid_target
 
-            # Letzten Setpoint laden
-            setpoint_last = float(state.get("last_setpoint", 0.0))
+            # Maximal mögliches Limit der aktiven Inverter ermitteln
+            max_limit = (2000.0 if hms_2000_online else 0.0) + (1600.0 if hms_1600_online else 0.0)
+            if max_limit == 0.0:
+                max_limit = 3600.0 if has_1600 else 2000.0
 
-            # Neuen Setpoint berechnen (Dämpfung mit Faktor 0.5)
-            setpoint_new = setpoint_last + grid_error * 0.5
-
-            # SOC-Grenzen anwenden
-            if low_soc_active:
-                # Entladen stoppen: Setpoint darf nicht positiv sein
-                setpoint_new = min(0.0, setpoint_new)
-            elif solix_soc >= soc_normal_max:
-                # Akku voll: Laden stoppen, Setpoint darf nicht negativ sein
-                setpoint_new = max(0.0, setpoint_new)
-
-            # Grenzwerte einhalten (max_charge bis max_discharge)
-            setpoint_new = max(-solix_max_charge, min(solix_max_discharge, setpoint_new))
-            
-            # Runden auf 10W Schritte zur Schonung
-            setpoint_new_rounded = round(setpoint_new / 10.0) * 10.0
-
-            # ------------------------------------------------------------------
-            # 6b. Hoymiles-Drosselung (wenn Akku voll oder Ladung blockiert)
-            # ------------------------------------------------------------------
-            hms_limit_last = float(state.get("last_hms_limit", 2000.0))
+            hms_limit_last = float(state.get("last_hms_limit", max_limit))
             hms_limit_new = hms_limit_last
 
-            # Wenn wir einspeisen (grid_error < -50) und der Akku nicht mehr laden kann
-            # (weil er voll ist oder das Setpoint-Limit erreicht hat), müssen wir den Hoymiles drosseln
-            if grid_error < -50:
-                # Kann der Akku noch mehr Ladeleistung aufnehmen?
-                if anker_smart_meter_active:
-                    akku_kann_laden = (solix_soc < soc_normal_max)
-                else:
-                    akku_kann_laden = (solix_soc < soc_normal_max) and (setpoint_new_rounded > -solix_max_charge)
-                if not akku_kann_laden:
-                    # Drosselung erforderlich
+            # Drossel-Auslöser: Wenn der Akku voll ist und Einspeisung vorliegt
+            if state["active_mode"] == "drosselung":
+                # Empfindlicher Schwellwert von -20W im Smart-Meter-Modus
+                if grid_error < -20.0:
+                    # Einspeisung: Hoymiles drosseln
                     hms_limit_new = hms_limit_last + grid_error * 0.5
-            elif grid_error > 50:
-                # Netzbezug: Hoymiles freigeben
-                hms_limit_new = hms_limit_last + grid_error * 0.5
+                elif grid_error > 20.0:
+                    # Netzbezug: Hoymiles freigeben
+                    hms_limit_new = hms_limit_last + grid_error * 0.5
+            else:
+                # Akku nicht voll: Beide Inverter voll öffnen, damit Anker Smart Meter den Überschuss einlagern kann.
+                hms_limit_new = max_limit
 
-            hms_limit_new = max(0.0, min(2000.0, hms_limit_new))
+            hms_limit_new = max(0.0, min(max_limit, hms_limit_new))
             hms_limit_new_rounded = round(hms_limit_new / 10.0) * 10.0
 
-            # ------------------------------------------------------------------
-            # 7. Hardware ansteuern (Modbus & HA)
-            # ------------------------------------------------------------------
-            if not anker_smart_meter_active:
-                # 1. Sicherstellen, dass Operating Mode auf 3 (Third-Party Control) steht
-                current_mode = read_holding_uint16(client, 10064)
-                if current_mode != 3:
-                    log.info("Setze Betriebsmodus auf Third-Party Control (Mode 3)...")
-                    write_holding_uint16(client, 10064, 3)
+            # Dynamic actual-production ratio splitting
+            limit_2000, limit_1600 = calc_hms_limits(
+                hms_limit_new_rounded, solar_p_2000, solar_p_1600,
+                hms_2000_online, hms_1600_online
+            )
 
-                # 2. Setpoint über Modbus an den Anker schreiben
-                write_holding_int32(client, 10071, int(setpoint_new_rounded))
-            else:
-                # Im Smart-Meter-Modus regelt die Solarbank über den Anker Smart Meter.
-                # Wir lesen nur Werte und überspringen das Senden von Sollwerten.
-                pass
-
-            # 3. Hoymiles limit über HA setzen (nur bei Änderungen >= 50W)
-            if hms_online:
-                if abs(hms_limit_last - hms_limit_new_rounded) >= 50:
-                    ha_set_number(hms_2000_entity, hms_limit_new_rounded)
-                    state["last_hms_limit"] = hms_limit_new_rounded
-
-            log.info("Modus=%s SOC=%.1f%% | Setpoint=%dW output=%.1fW | grid=%.0fW haus=%.0fW HMS-Limit=%dW",
-                     state["active_mode"], solix_soc, setpoint_new_rounded, solix_ac_output,
-                     grid_p_raw, haus_p, hms_limit_new_rounded)
+            # Drossel-Status für Log / UI ermitteln
+            drosseln = (hms_limit_new_rounded < max_limit - 100.0) and (solar_p_inverters >= hms_limit_new_rounded - 150.0)
 
             # ------------------------------------------------------------------
-            # 8. Logs und State speichern
+            # 6. Inverter limits über Home Assistant setzen
+            # ------------------------------------------------------------------
+            do_is_update = (is_tick % 6 == 0) # Alle 30 Sekunden forcieren
+
+            if hms_2000_online:
+                last_written_2000 = float(state.get("last_hms_2000_lim", 2000.0))
+                need_send_2000 = (abs(last_written_2000 - limit_2000) >= 50) or (drosseln and solar_p_2000 > limit_2000 + 50 and do_is_update)
+                if need_send_2000:
+                    if ha_set_number(hms_2000_entity, limit_2000):
+                        state["last_hms_2000_lim"] = limit_2000
+
+            if has_1600 and hms_1600_online:
+                last_written_1600 = float(state.get("last_hms_1600_lim", 1600.0))
+                need_send_1600 = (abs(last_written_1600 - limit_1600) >= 50) or (drosseln and solar_p_1600 > limit_1600 + 50 and do_is_update)
+                if need_send_1600:
+                    if ha_set_number(hms_1600_entity, limit_1600):
+                        state["last_hms_1600_lim"] = limit_1600
+
+            log.info("Modus=%s SOC=%.1f%% | HMS-Limit=%dW (HMS-2000: %dW, HMS-1600: %dW) | grid=%.0fW haus=%.0fW solar=%.0fW",
+                     state["active_mode"], solix_soc, int(hms_limit_new_rounded), int(limit_2000), int(limit_1600),
+                     grid_p_raw, haus_p, solar_p_inverters + solix_pv)
+
+            # ------------------------------------------------------------------
+            # 7. Daten speichern & HA Sensoren aktualisieren
             # ------------------------------------------------------------------
             csv_log({
-                "ts":        time.strftime("%Y-%m-%d %H:%M:%S"),
-                "mode":      state["active_mode"],
-                "soc":       round(solix_soc, 1),
-                "grid_p":    round(grid_p_raw, 1),
-                "haus_p":    round(haus_p, 1),
-                "solar_p":   round(solix_pv + (solar_p_hms if hms_online else 0.0), 1),
-                "setpoint":  round(setpoint_new_rounded, 0),
-                "battery_p": round(solix_battery_p, 1),
-                "pv":        round(solix_pv, 1),
-                "load_p":    round(solix_load_p, 1),
-                "hms_limit": round(hms_limit_new_rounded, 0),
-                "hms_power": round(solar_p_hms, 1),
-                "hms_online": 1 if hms_online else 0
+                "ts":             time.strftime("%Y-%m-%d %H:%M:%S"),
+                "mode":           state["active_mode"],
+                "soc":            round(solix_soc, 1),
+                "grid_p":         round(grid_p_raw, 1),
+                "haus_p":         round(haus_p, 1),
+                "solar_p":        round(solar_p_inverters + solix_pv, 1),
+                "battery_p":      round(solix_battery_p, 1),
+                "pv":             round(solix_pv, 1),
+                "load_p":         round(solix_load_p, 1),
+                "hms_limit":      round(hms_limit_new_rounded, 0),
+                "hms_2000_power": round(solar_p_2000, 1),
+                "hms_2000_lim":   round(limit_2000, 0),
+                "hms_2000_online": 1 if hms_2000_online else 0,
+                "hms_1600_power": round(solar_p_1600, 1),
+                "hms_1600_lim":   round(limit_1600, 0),
+                "hms_1600_online": 1 if hms_1600_online else 0,
             })
 
             # Virtuelle Sensoren an HA pushen
             ha_push_sensor("sensor.anker_hausverbrauch", haus_p, "W", "power", "Hausverbrauch (Anker Controller)")
             ha_push_sensor("sensor.anker_grid_p", grid_p_raw, "W", "power", "Netz aktuell (Anker Controller)")
-            ha_push_sensor("sensor.anker_solar_p", solix_pv + (solar_p_hms if hms_online else 0.0), "W", "power", "Solar gesamt (Anker Controller)")
+            ha_push_sensor("sensor.anker_solar_p", solix_pv + solar_p_inverters, "W", "power", "Solar gesamt (Anker Controller)")
             ha_push_sensor("sensor.anker_battery_ac", solix_ac_output, "W", "power", "Batterie AC (Anker Controller)")
             ha_push_sensor("sensor.anker_solix_soc", solix_soc, "%", "battery", "Anker Solix SOC")
             ha_push_sensor("sensor.anker_solix_pv", solix_pv, "W", "power", "Anker Solix PV Leistung")
             ha_push_sensor("sensor.anker_solix_battery_power", solix_battery_p, "W", "power", "Anker Solix Batterie Leistung")
             ha_push_sensor("sensor.anker_solix_load_power", solix_load_p, "W", "power", "Anker Solix Last Leistung")
-            ha_push_sensor("sensor.anker_solix_setpoint", setpoint_new_rounded, "W", "power", "Anker Solix Sollwert")
 
             state["grid_p_filtered"] = grid_p_raw
-            state["solar_p_last"]    = solar_p_hms
+            state["solar_p_last"]    = solar_p_inverters
+            state["hms_2000_power_last"] = solar_p_2000
+            state["hms_1600_power_last"] = solar_p_1600
             state["haus_p_last"]     = haus_p
-            state["last_setpoint"]   = setpoint_new_rounded
+            state["last_hms_limit"]  = hms_limit_new_rounded
             state["pv_last"]         = solix_pv
             save_state_throttled(state)
 
@@ -707,12 +602,11 @@ def main():
         sleep_tick(TICK_S - elapsed)
 
     # Shutdown-Safe-State
-    log.info("Shutdown — übergebe an Geräte-Selbstregelung...")
+    log.info("Shutdown — öffne Hoymiles Limits voll zur Sicherheit...")
     try:
-        if not anker_smart_meter_active:
-            # Betriebsmodus auf Self-Consumption (0) setzen, damit das Gerät selbst regelt
-            write_holding_uint16(client, 10064, 0)
         ha_set_number(hms_2000_entity, 2000)
+        if has_1600:
+            ha_set_number(hms_1600_entity, 1600)
     except Exception as e:
         log.error("Fehler beim Shutdown-Safe-State: %s", e)
     log.info("Controller beendet.")
